@@ -1,86 +1,110 @@
+from pathlib import Path
+import random
+from typing import List, Tuple
+
 import torch
-import os
-import json
-from torch.utils.data import Dataset
-from torchvision import transforms
-from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset, DataLoader
 from PIL import Image
+from torchvision import transforms
+
+
+def _get_subject_id(fname: str) -> str:
+    # subject id is prefix before first underscore
+    return Path(fname).stem.split('_')[0]
+
 
 class ADNIDataset(Dataset):
-    def __init__(self, data_dir, split='train', transform=None, validation_split=0.1):
-        self.data_dir = data_dir
-        self.split = split
+    def __init__(self, items: List[Tuple[Path, int]], transform=None):
+        self.items = items
         self.transform = transform
-        self.validation_split = validation_split
-        
-        metadata_path = os.path.join(data_dir, 'meta_data_with_label.json')
-        try:
-            with open(metadata_path, 'r') as f:
-                self.metadata = json.load(f)
-        except FileNotFoundError:
-            self.metadata = {} # Proceed without metadata if file not found
-        
-        # Load file paths and labels
-        self.data = self.load_data_paths()
-
-    def load_data_paths(self):
-        """Load file paths and labels"""
-        all_data = []
-        
-        if self.split in ['train', 'validation']:
-            train_path = os.path.join(self.data_dir, 'AD_NC', 'train')
-            all_data.extend(self.get_paths_from_folder(train_path, 'AD', label=1))
-            all_data.extend(self.get_paths_from_folder(train_path, 'NC', label=0))
-            
-            if len(all_data) > 0:
-                train_data, val_data = train_test_split(
-                    all_data, 
-                    test_size=self.validation_split, 
-                    random_state=42,
-                    stratify=[item[1] for item in all_data]
-                )
-                return train_data if self.split == 'train' else val_data
-            else:
-                return [] # Return empty list if no data
-        
-        elif self.split == 'test':
-            test_path = os.path.join(self.data_dir, 'AD_NC', 'test')
-            all_data.extend(self.get_paths_from_folder(test_path, 'AD', label=1))
-            all_data.extend(self.get_paths_from_folder(test_path, 'NC', label=0))
-        
-        return all_data
-
-    def get_paths_from_folder(self, base_path, class_name, label):
-        """Get list of (image_path, label) tuples"""
-        class_path = os.path.join(base_path, class_name)
-        if not os.path.exists(class_path):
-            return []
-        
-        data = []
-        for image_name in os.listdir(class_path):
-            if image_name.endswith('.jpeg'):
-                subject_id = image_name.split('_')[0]
-                
-                # Load if metadata is missing OR if subject is in metadata
-                if not self.metadata or subject_id in self.metadata:
-                    image_path = os.path.join(class_path, image_name)
-                    data.append((image_path, label))
-        return data
 
     def __len__(self):
-        return len(self.data)
+        return len(self.items)
 
-if __name__ == "__main__":
-    DATA_ROOT = "ADNI" 
-    
-    if not os.path.exists(DATA_ROOT):
-        print(f"Error: Data directory not found at {DATA_ROOT}")
-    else:
-        print("Testing Dataset Initialization...")
-        train_dataset = ADNIDataset(DATA_ROOT, split='train')
-        val_dataset = ADNIDataset(DATA_ROOT, split='validation')
-        test_dataset = ADNIDataset(DATA_ROOT, split='test')
-        
-        print(f"Train dataset length: {len(train_dataset)}")
-        print(f"Validation dataset length: {len(val_dataset)}")
-        print(f"Test dataset length: {len(test_dataset)}")
+    def __getitem__(self, idx):
+        path, label = self.items[idx]
+        img = Image.open(path).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+
+def build_subject_splits(root: str, train_dir_name='train', val_ratio=0.15, seed=42):
+    root = Path(root)
+    train_root = root / 'AD_NC' / train_dir_name
+    classes = ['AD', 'NC']
+    class_to_label = {'AD': 1, 'NC': 0}
+
+    subjects_per_class = {}
+    files_per_subject = {}
+
+    for cls in classes:
+        cls_dir = train_root / cls
+        if not cls_dir.exists():
+            continue
+        files = sorted(p for p in cls_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png'))
+        subj_map = {}
+        for f in files:
+            sid = _get_subject_id(f.name)
+            subj_map.setdefault(sid, []).append(f)
+        subjects_per_class[cls] = list(subj_map.keys())
+        files_per_subject.update({(cls, sid): subj_map[sid] for sid in subj_map})
+
+    # split subjects per class
+    random.seed(seed)
+    train_items = []
+    val_items = []
+    for cls in classes:
+        sids = subjects_per_class.get(cls, [])
+        random.shuffle(sids)
+        n_val = max(1, int(len(sids) * val_ratio))
+        val_sids = set(sids[:n_val])
+        for sid in sids:
+            paths = files_per_subject[(cls, sid)]
+            label = 1 if cls == 'AD' else 0
+            if sid in val_sids:
+                for p in paths:
+                    val_items.append((p, label))
+            else:
+                for p in paths:
+                    train_items.append((p, label))
+
+    return train_items, val_items
+
+
+def build_dataloaders(root: str, batch_size: int = 64, image_size: int = 224, val_ratio: float = 0.15,
+                      num_workers: int = 4, seed: int = 42):
+    train_items, val_items = build_subject_splits(root, val_ratio=val_ratio, seed=seed)
+
+    imagenet_mean = [0.485, 0.456, 0.406]
+    imagenet_std = [0.229, 0.224, 0.225]
+
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomApply([transforms.RandAugment(num_ops=2, magnitude=9)], p=0.5),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
+        transforms.RandomErasing(p=0.25)
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.Resize(int(image_size * 256 / 224)),
+        transforms.CenterCrop(image_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=imagenet_mean, std=imagenet_std)
+    ])
+
+    train_ds = ADNIDataset(train_items, transform=train_transform)
+    val_ds = ADNIDataset(val_items, transform=val_transform)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+
+    return train_loader, val_loader
+
+
+if __name__ == '__main__':
+    # quick sanity check (won't run heavy ops during imports)
+    tr, va = build_dataloaders(str(Path.home() / 'CUONG' / 'ADNI'), batch_size=8, image_size=224)
+    print('train batches:', len(tr), 'val batches:', len(va))
