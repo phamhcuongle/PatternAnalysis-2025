@@ -9,7 +9,6 @@ from torchvision import transforms
 
 
 def _get_subject_id(fname: str) -> str:
-    # subject id is prefix before first underscore
     return Path(fname).stem.split('_')[0]
 
 
@@ -33,7 +32,6 @@ def build_subject_splits(root: str, train_dir_name='train', val_ratio=0.15, seed
     root = Path(root)
     train_root = root / 'AD_NC' / train_dir_name
     classes = ['AD', 'NC']
-    class_to_label = {'AD': 1, 'NC': 0}
 
     subjects_per_class = {}
     files_per_subject = {}
@@ -50,7 +48,6 @@ def build_subject_splits(root: str, train_dir_name='train', val_ratio=0.15, seed
         subjects_per_class[cls] = list(subj_map.keys())
         files_per_subject.update({(cls, sid): subj_map[sid] for sid in subj_map})
 
-    # split subjects per class
     random.seed(seed)
     train_items = []
     val_items = []
@@ -59,14 +56,12 @@ def build_subject_splits(root: str, train_dir_name='train', val_ratio=0.15, seed
         random.shuffle(sids)
         n_val = max(1, int(len(sids) * val_ratio))
         val_sids = set(sids[:n_val])
+        label = 0 if cls == 'AD' else 1
         for sid in sids:
-            paths = files_per_subject[(cls, sid)]
-            label = 1 if cls == 'AD' else 0
-            if sid in val_sids:
-                for p in paths:
+            for p in files_per_subject[(cls, sid)]:
+                if sid in val_sids:
                     val_items.append((p, label))
-            else:
-                for p in paths:
+                else:
                     train_items.append((p, label))
 
     return train_items, val_items
@@ -82,10 +77,10 @@ def build_dataloaders(root: str, batch_size: int = 64, image_size: int = 224, va
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
         transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(degrees=15),
         transforms.RandomApply([transforms.RandAugment(num_ops=2, magnitude=9)], p=0.5),
         transforms.ToTensor(),
-        transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
-        transforms.RandomErasing(p=0.25)
+        transforms.Normalize(mean=imagenet_mean, std=imagenet_std)
     ])
 
     val_transform = transforms.Compose([
@@ -105,6 +100,15 @@ def build_dataloaders(root: str, batch_size: int = 64, image_size: int = 224, va
 
 
 if __name__ == '__main__':
-    # quick sanity check (won't run heavy ops during imports)
-    tr, va = build_dataloaders(str(Path.home() / 'CUONG' / 'ADNI'), batch_size=8, image_size=224)
-    print('train batches:', len(tr), 'val batches:', len(va))
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--root', type=str, default='./ADNI')
+    parser.add_argument('--batch-size', type=int, default=8)
+    parser.add_argument('--num-workers', type=int, default=2)
+    args = parser.parse_args()
+    
+    if not Path(args.root).exists():
+        print(f"Error: Data directory not found at {args.root}")
+    else:
+        tr, va = build_dataloaders(args.root, batch_size=args.batch_size, image_size=224, num_workers=args.num_workers)
+        print(f'train batches: {len(tr)}, val batches: {len(va)}')
