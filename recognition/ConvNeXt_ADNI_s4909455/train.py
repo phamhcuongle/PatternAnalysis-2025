@@ -10,7 +10,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import f1_score, accuracy_score, confusion_matrix
 from timm.utils import ModelEma
-from tqdm import tqdm
+from tqdm.notebook import tqdm
 
 from modules import convnext_small
 from dataset import build_loader
@@ -414,10 +414,10 @@ def main(args):
         lr = scheduler.step(epoch)
         
         if mixup_cutmix is not None:
-            if epoch < 150:
+            if epoch < 100:
                 mixup_cutmix.set_enabled(True)
-            elif epoch < 300:
-                progress = (epoch - 150) / 150
+            elif epoch < 150:
+                progress = (epoch - 100) / 50
                 mixup_cutmix.prob = 1.0 - progress
                 mixup_cutmix.set_enabled(True)
             else:
@@ -612,21 +612,21 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('ConvNeXt-S training for ADNI dataset')
     
-    parser.add_argument('--data_path', type=str, default='AD_NC',
+    parser.add_argument('--data_path', type=str, default='ADNI/AD_NC',
                         help='Path to ADNI dataset')
-    parser.add_argument('--output_dir', type=str, default='output',
+    parser.add_argument('--output_dir', type=str, default='ADNI_outputs',
                         help='Path to save outputs')
     parser.add_argument('--pretrained_path', type=str, default='convnext_small_22k_224.pth',
                         help='Path to pretrained weights (ImageNet-22k). Set to empty string to train from scratch.')
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=128,
                         help='Batch size')
-    parser.add_argument('--epochs', type=int, default=400,
+    parser.add_argument('--epochs', type=int, default=200,
                         help='Number of epochs')
     parser.add_argument('--lr', type=float, default=5e-4,
                         help='Learning rate')
     parser.add_argument('--min_lr', type=float, default=1e-6,
                         help='Minimum learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.05,
+    parser.add_argument('--weight_decay', type=float, default=0.1,
                         help='Weight decay')
     parser.add_argument('--betas', type=float, nargs=2, default=[0.9, 0.999],
                         help='AdamW betas')
@@ -661,4 +661,3 @@ if __name__ == '__main__':
     np.random.seed(args.seed)
     
     main(args)
-
