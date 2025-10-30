@@ -1,289 +1,664 @@
-import argparse
-import math
 import os
-from pathlib import Path
+import argparse
 import time
-import random
+from pathlib import Path
 import numpy as np
-
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from sklearn.metrics import f1_score, accuracy_score, confusion_matrix
+from timm.utils import ModelEma
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 
-from modules import convnext_b
-from dataset import build_dataloaders
-from predict import evaluate, load_model
+from modules import convnext_small
+from dataset import build_loader
 
 
-def get_layerwise_param_groups(model, base_lr, weight_decay, layer_decay=0.8):
-    param_groups = {}
-    num_stages = 4
-
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        group_lr = base_lr
-        if 'stages.' in name:
-            try:
-                idx = int(name.split('stages.')[1].split('.')[0])
-                scale = layer_decay ** (num_stages - 1 - idx)
-                group_lr = base_lr * scale
-            except Exception:
-                group_lr = base_lr
-        elif 'downsample_layers.' in name:
-            try:
-                idx = int(name.split('downsample_layers.')[1].split('.')[0])
-                scale = layer_decay ** (num_stages - 1 - idx)
-                group_lr = base_lr * scale
-            except Exception:
-                group_lr = base_lr
-
-        key = (group_lr, weight_decay)
-        if key not in param_groups:
-            param_groups[key] = {'params': [], 'lr': group_lr, 'weight_decay': weight_decay}
-        param_groups[key]['params'].append(param)
-
-    return list(param_groups.values())
-
-
-def accuracy(output, target):
-    preds = output.argmax(dim=1)
-    return (preds == target).float().mean().item()
-
-def _rand_bbox(H, W, lam):
-    cut_rat = math.sqrt(max(0.0, 1. - lam))
-    cut_w = int(W * cut_rat)
-    cut_h = int(H * cut_rat)
-
-    cx = random.randint(0, W)
-    cy = random.randint(0, H)
-
-    bbx1 = np.clip(cx - cut_w // 2, 0, W)
-    bby1 = np.clip(cy - cut_h // 2, 0, H)
-    bbx2 = np.clip(cx + cut_w // 2, 0, W)
-    bby2 = np.clip(cy + cut_h // 2, 0, H)
-
-    return int(bbx1), int(bby1), int(bbx2), int(bby2)
-
-
-def apply_mixup_cutmix_same_class(images, labels, alpha=0.4, device='cpu', use_cutmix=False):
-    B, C, H, W = images.shape
-    labels = labels.to(device)
-
-    pair_idx = torch.empty(B, dtype=torch.long, device=device)
-    for i in range(B):
-        same = (labels == labels[i]).nonzero(as_tuple=False).squeeze()
-        if same.numel() == 0:
-            pair_idx[i] = i
+class MixupCutmix:
+    def __init__(self, mixup_alpha=0.8, cutmix_alpha=1.0, prob=1.0, switch_prob=0.5, num_classes=2):
+        self.mixup_alpha = mixup_alpha
+        self.cutmix_alpha = cutmix_alpha
+        self.prob = prob
+        self.switch_prob = switch_prob
+        self.num_classes = num_classes
+        self.enabled = True
+    
+    def set_enabled(self, enabled):
+        self.enabled = enabled
+    
+    def mixup(self, images, labels):
+        """Apply MixUp augmentation"""
+        batch_size = images.size(0)
+        lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
+        index = torch.randperm(batch_size).to(images.device)
+        
+        mixed_images = lam * images + (1 - lam) * images[index]
+        labels_a = labels
+        labels_b = labels[index]
+        mixed_labels = lam * labels_a + (1 - lam) * labels_b
+        
+        return mixed_images, mixed_labels
+    
+    def cutmix(self, images, labels):
+        """Apply CutMix augmentation"""
+        batch_size = images.size(0)
+        lam = np.random.beta(self.cutmix_alpha, self.cutmix_alpha)
+        index = torch.randperm(batch_size).to(images.device)
+        
+        _, _, h, w = images.size()
+        cut_rat = np.sqrt(1. - lam)
+        cut_w = int(w * cut_rat)
+        cut_h = int(h * cut_rat)
+        
+        cx = np.random.randint(w)
+        cy = np.random.randint(h)
+        
+        bbx1 = np.clip(cx - cut_w // 2, 0, w)
+        bby1 = np.clip(cy - cut_h // 2, 0, h)
+        bbx2 = np.clip(cx + cut_w // 2, 0, w)
+        bby2 = np.clip(cy + cut_h // 2, 0, h)
+        
+        mixed_images = images.clone()
+        mixed_images[:, :, bby1:bby2, bbx1:bbx2] = images[index, :, bby1:bby2, bbx1:bbx2]
+        
+        lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (w * h))
+        labels_a = labels
+        labels_b = labels[index]
+        mixed_labels = lam * labels_a + (1 - lam) * labels_b
+        
+        return mixed_images, mixed_labels
+    
+    def __call__(self, images, labels):
+        if not self.enabled or np.random.rand() > self.prob:
+            return images, labels
+        
+        if np.random.rand() < self.switch_prob:
+            return self.cutmix(images, labels)
         else:
-            j = same[torch.randint(0, same.numel(), (1,)).item()]
-            pair_idx[i] = j
-
-    images2 = images[pair_idx]
-    labels_a = labels
-    labels_b = labels[pair_idx]
-
-    lam = np.random.beta(alpha, alpha, size=B).astype(np.float32)
-    lams = torch.from_numpy(lam).to(device)
-
-    mixed_images = images.clone()
-    if use_cutmix:
-        for i in range(B):
-            lam_i = float(lams[i].item())
-            bbx1, bby1, bbx2, bby2 = _rand_bbox(H, W, lam_i)
-            mixed_images[i, :, bby1:bby2, bbx1:bbx2] = images2[i, :, bby1:bby2, bbx1:bbx2]
-            area = (bbx2 - bbx1) * (bby2 - bby1)
-            lams[i] = 1.0 - float(area) / float(H * W)
-    else:
-        lams_img = lams.view(B, 1, 1, 1)
-        mixed_images = images * lams_img + images2 * (1.0 - lams_img)
-
-    return mixed_images, labels_a, labels_b, lams
+            return self.mixup(images, labels)
 
 
-def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch, max_mix_prob=0.5, mix_decay_epochs=50, mix_alpha=0.4):
+class WarmupCosineScheduler:
+    """Learning rate scheduler with linear warmup and cosine decay"""
+    def __init__(self, optimizer, warmup_epochs, total_epochs, base_lr, min_lr=1e-6):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.base_lr = base_lr
+        self.min_lr = min_lr
+        self.current_epoch = 0
+    
+    def step(self, epoch):
+        self.current_epoch = epoch
+        if epoch < self.warmup_epochs:
+            lr = self.base_lr * (epoch + 1) / self.warmup_epochs
+        else:
+            progress = (epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
+            lr = self.min_lr + (self.base_lr - self.min_lr) * 0.5 * (1 + np.cos(np.pi * progress))
+        
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+        
+        return lr
+
+
+def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, mixup_cutmix=None, ema=None, label_smoothing=0.1):
+    """Train for one epoch"""
     model.train()
-    running_loss = 0.0
-    running_acc = 0.0
-    n = 0
-    pbar = tqdm(loader, desc='train', leave=False)
-    for images, labels in pbar:
+    total_loss = 0
+    all_preds = []
+    all_labels = []
+    
+    pbar = tqdm(train_loader, desc=f'Epoch {epoch+1} [Train]', leave=False)
+    for batch_idx, (images, labels) in enumerate(pbar):
         images = images.to(device)
-        labels = labels.to(device)
+        labels = labels.to(device).float()
+        original_labels = labels.clone()
+        
+        if mixup_cutmix and mixup_cutmix.enabled:
+            images, labels_for_loss = mixup_cutmix(images, labels)
+        else:
+            labels_for_loss = labels * (1 - label_smoothing) + label_smoothing / 2
+        
         optimizer.zero_grad()
-
-        # schedule mix probability: linear decay from max_mix_prob -> 0 over mix_decay_epochs
-        if epoch <= mix_decay_epochs:
-            mix_prob = max_mix_prob * (1.0 - (epoch - 1) / float(max(1, mix_decay_epochs)))
-        else:
-            mix_prob = 0.0
-
-        do_mix = random.random() < mix_prob
-        if do_mix:
-            use_cutmix = random.random() < 0.5
-            mixed_images, labels_a, labels_b, lams = apply_mixup_cutmix_same_class(
-                images, labels, alpha=mix_alpha, device=device, use_cutmix=use_cutmix)
-            out = model(mixed_images)
-            loss_a = loss_fn(out, labels_a)
-            loss_b = loss_fn(out, labels_b)
-            if loss_a.ndim == 0:
-                loss_a = loss_a.unsqueeze(0)
-                loss_b = loss_b.unsqueeze(0)
-            loss = (lams * loss_a + (1.0 - lams) * loss_b).mean()
-        else:
-            out = model(images)
-            l = loss_fn(out, labels)
-            loss = l.mean() if l.ndim > 0 else l
-
+        outputs = model(images).squeeze()
+        loss = criterion(outputs, labels_for_loss)
         loss.backward()
         optimizer.step()
-        bs = images.size(0)
-        running_loss += loss.item() * bs
-        running_acc += accuracy(out, labels) * bs
-        n += bs
-        pbar.set_postfix(loss=running_loss / n, acc=running_acc / n, mix_prob=f"{mix_prob:.3f}")
-    return running_loss / n, running_acc / n
+        
+        if ema is not None:
+            ema.update(model)
+        
+        total_loss += loss.item()
+        
+        with torch.no_grad():
+            preds = (torch.sigmoid(outputs) > 0.5).float()
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(original_labels.cpu().numpy())
+        
+        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+    
+    avg_loss = total_loss / len(train_loader)
+    f1 = f1_score(all_labels, all_preds)
+    acc = accuracy_score(all_labels, all_preds)
+    
+    return avg_loss, f1, acc
 
 
-def validate(model, loader, loss_fn, device):
+def validate(model, val_loader, criterion, device, threshold=0.5, return_probs=False):
     model.eval()
-    running_loss = 0.0
-    running_acc = 0.0
-    n = 0
+    total_loss = 0
+    all_probs = []
+    all_labels = []
+    
     with torch.no_grad():
-        for images, labels in tqdm(loader, desc='val', leave=False):
+        pbar = tqdm(val_loader, desc='Validation', leave=False)
+        for images, labels in pbar:
             images = images.to(device)
-            labels = labels.to(device)
-            out = model(images)
-            loss_t = loss_fn(out, labels)
-            loss_val = loss_t.mean().item() if isinstance(loss_t, torch.Tensor) else float(loss_t)
-            bs = images.size(0)
-            running_loss += loss_val * bs
-            running_acc += accuracy(out, labels) * bs
-            n += bs
-    return running_loss / n, running_acc / n
+            labels = labels.to(device).float()
+            
+            outputs = model(images).squeeze()
+            loss = criterion(outputs, labels)
+            
+            total_loss += loss.item()
+            
+            probs = torch.sigmoid(outputs)
+            all_probs.extend(probs.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+    
+    avg_loss = total_loss / len(val_loader)
+    all_probs = np.array(all_probs)
+    all_labels = np.array(all_labels)
+    
+    if return_probs:
+        return avg_loss, all_probs, all_labels
+    
+    all_preds = (all_probs > threshold).astype(float)
+    f1 = f1_score(all_labels, all_preds)
+    acc = accuracy_score(all_labels, all_preds)
+    cm = confusion_matrix(all_labels, all_preds)
+    
+    return avg_loss, f1, acc, cm
 
 
-def plot_stats(stats, out_dir: Path):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    epochs = list(range(1, len(stats['train_loss']) + 1))
-    plt.figure()
-    plt.plot(epochs, stats['train_loss'], label='train_loss')
-    plt.plot(epochs, stats['val_loss'], label='val_loss')
-    plt.legend()
-    plt.xlabel('epoch')
-    plt.ylabel('loss')
-    plt.savefig(out_dir / 'loss.png')
-    plt.close()
+def find_optimal_threshold(probs, labels, metric='f1'):
+    thresholds = np.arange(0.1, 0.95, 0.05)
+    scores = []
+    
+    for thresh in thresholds:
+        preds = (probs > thresh).astype(float)
+        
+        if metric == 'f1':
+            score = f1_score(labels, preds)
+        elif metric == 'balanced_acc':
+            cm = confusion_matrix(labels, preds)
+            tn, fp, fn, tp = cm.ravel()
+            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+            score = (sensitivity + specificity) / 2
+        elif metric == 'youden':
+            cm = confusion_matrix(labels, preds)
+            tn, fp, fn, tp = cm.ravel()
+            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+            score = sensitivity + specificity - 1  # Youden's J statistic
+        
+        scores.append(score)
+    
+    best_idx = np.argmax(scores)
+    best_threshold = thresholds[best_idx]
+    best_score = scores[best_idx]
+    
+    return best_threshold, best_score, list(zip(thresholds, scores))
 
-    plt.figure()
-    plt.plot(epochs, stats['train_acc'], label='train_acc')
-    plt.plot(epochs, stats['val_acc'], label='val_acc')
-    plt.legend()
-    plt.xlabel('epoch')
-    plt.ylabel('accuracy')
-    plt.savefig(out_dir / 'acc.png')
+
+def test(model, test_loader, device, threshold=0.5):
+    model.eval()
+    all_preds = []
+    all_labels = []
+    all_probs = []
+    
+    with torch.no_grad():
+        pbar = tqdm(test_loader, desc='Testing', leave=False)
+        for images, labels in pbar:
+            images = images.to(device)
+            labels = labels.to(device).float()
+            
+            outputs = model(images).squeeze()
+            probs = torch.sigmoid(outputs)
+            preds = (probs > threshold).float()
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+    
+    f1 = f1_score(all_labels, all_preds)
+    acc = accuracy_score(all_labels, all_preds)
+    cm = confusion_matrix(all_labels, all_preds)
+    
+    return f1, acc, cm, all_probs, all_preds, all_labels
+
+
+def plot_metrics(train_losses, val_losses, train_f1s, val_f1s, train_accs, val_accs, 
+                 test_f1s, test_accs, test_epochs, save_path):
+    """Plot training, validation and test metrics"""
+    epochs = range(1, len(train_losses) + 1)
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    
+    axes[0].plot(epochs, train_losses, 'b-', label='Train Loss', linewidth=2)
+    axes[0].plot(epochs, val_losses, 'r-', label='Val Loss', linewidth=2)
+    axes[0].set_xlabel('Epoch', fontsize=12)
+    axes[0].set_ylabel('Loss', fontsize=12)
+    axes[0].set_title('Training and Validation Loss', fontsize=14)
+    axes[0].legend(fontsize=10)
+    axes[0].grid(True, alpha=0.3)
+    
+    axes[1].plot(epochs, train_f1s, 'b-', label='Train F1', linewidth=2)
+    axes[1].plot(epochs, val_f1s, 'r-', label='Val F1', linewidth=2)
+    if test_f1s:
+        axes[1].plot(test_epochs, test_f1s, 'go-', label='Test F1', linewidth=2, markersize=6)
+    axes[1].set_xlabel('Epoch', fontsize=12)
+    axes[1].set_ylabel('F1 Score', fontsize=12)
+    axes[1].set_title('F1 Score', fontsize=14)
+    axes[1].legend(fontsize=10)
+    axes[1].grid(True, alpha=0.3)
+    
+    axes[2].plot(epochs, train_accs, 'b-', label='Train Acc', linewidth=2)
+    axes[2].plot(epochs, val_accs, 'r-', label='Val Acc', linewidth=2)
+    if test_accs:
+        axes[2].plot(test_epochs, test_accs, 'go-', label='Test Acc', linewidth=2, markersize=6)
+    axes[2].set_xlabel('Epoch', fontsize=12)
+    axes[2].set_ylabel('Accuracy', fontsize=12)
+    axes[2].set_title('Accuracy', fontsize=14)
+    axes[2].legend(fontsize=10)
+    axes[2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
     plt.close()
 
 
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    train_loader, val_loader = build_dataloaders(args.data_root, batch_size=args.batch_size,
-                                                image_size=args.img_size, val_ratio=0.15,
-                                                num_workers=args.num_workers)
-
-    model = convnext_b(num_classes=2, in_chans=3, pretrained_path=args.pretrained, device=device).to(device)
-
-    param_groups = get_layerwise_param_groups(model, args.lr, args.weight_decay, args.layer_decay)
-    optimizer = optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.999), weight_decay=args.weight_decay)
-
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
-
-    loss_fn = nn.CrossEntropyLoss(reduction='none', label_smoothing=args.label_smoothing)
-
-    stats = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
-
-    best_val_acc = 0.0
-    epochs_since_best = 0
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    for epoch in range(1, args.epochs + 1):
-        start = time.time()
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, loss_fn, device,
-                                                epoch, max_mix_prob=args.mix_max_prob,
-                                                mix_decay_epochs=args.mix_decay_epochs,
-                                                mix_alpha=args.mix_alpha)
-        val_loss, val_acc = validate(model, val_loader, loss_fn, device)
-        scheduler.step()
-
-        stats['train_loss'].append(train_loss)
-        stats['val_loss'].append(val_loss)
-        stats['train_acc'].append(train_acc)
-        stats['val_acc'].append(val_acc)
-
-        # get learning rates for all param groups and print epoch summary
-        lrs = [pg.get('lr', None) for pg in optimizer.param_groups]
-        lr_str = ','.join([f"{lr:.3e}" for lr in lrs])
-        print(f"Epoch {epoch}/{args.epochs}  lr={lr_str}  train_loss={train_loss:.4f} train_acc={train_acc:.4f}  val_loss={val_loss:.4f} val_acc={val_acc:.4f}  time={time.time()-start:.1f}s")
-
-        # save best
-        if val_acc > best_val_acc:
-            print(f"  ** New best validation accuracy: {val_acc:.4f}! Saving model to {out_dir / 'best.pth'} **")
-            best_val_acc = val_acc
-            epochs_since_best = 0
-            torch.save({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict()}, out_dir / 'best.pth')
+    print(f'Using device: {device}')
+    
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    train_loader, val_loader, test_loader = build_loader(
+        root_dir=args.data_path,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        input_size=args.input_size,
+        seed=args.seed
+    )
+    
+    print(f'Train samples: {len(train_loader.dataset)}')
+    print(f'Val samples: {len(val_loader.dataset)}')
+    print(f'Test samples: {len(test_loader.dataset)}')
+    
+    # Determine if using pretrained head
+    use_pretrained_head = args.pretrained_path and os.path.exists(args.pretrained_path)
+    
+    model = convnext_small(
+        num_classes=1,
+        drop_path_rate=args.drop_path_rate,
+        layer_scale_init_value=args.layer_scale_init_value,
+        use_pretrained_head=use_pretrained_head
+    )
+    
+    # Load pretrained weights from ImageNet-22k
+    if use_pretrained_head:
+        print(f'Loading pretrained weights from {args.pretrained_path}')
+        print(f'Using two-stage head: pretrained ImageNet-22k head (21841 classes) + adapter layer (21841→1)')
+        checkpoint = torch.load(args.pretrained_path, map_location='cpu')
+        
+        # Handle different checkpoint formats
+        if 'model' in checkpoint:
+            pretrained_dict = checkpoint['model']
+        elif 'state_dict' in checkpoint:
+            pretrained_dict = checkpoint['state_dict']
         else:
-            epochs_since_best += 1
-
-        # early stopping check
-        if args.early_stop > 0 and epochs_since_best >= args.early_stop:
-            print(f"Early stopping: no improvement for {epochs_since_best} epochs (early_stop={args.early_stop})")
-            break
-
-        # periodic save
-        if epoch % args.save_every == 0:
-            torch.save({'epoch': epoch, 'model_state': model.state_dict()}, out_dir / f'epoch_{epoch}.pth')
-
-        # run evaluation on test set using best weights every eval_every epochs
-        if args.eval_every > 0 and (epoch % args.eval_every == 0):
-            best_ckpt = out_dir / 'best.pth'
-            if best_ckpt.exists():
-                print(f"Evaluating best checkpoint at epoch {epoch} on test set...")
-                try:
-                    test_model, test_device = load_model(str(best_ckpt), device=device)
-                    # Pass output_dir so plot is saved to Drive
-                    evaluate(test_model, test_device, args.data_root, args.output_dir,
-                             img_size=args.img_size, batch_size=args.batch_size)
-                except Exception as e:
-                    print(f"Test evaluation failed: {e}")
-
-    plot_stats(stats, out_dir)
-    # final save
-    torch.save({'epoch': args.epochs, 'model_state': model.state_dict()}, out_dir / 'final.pth')
+            pretrained_dict = checkpoint
+        
+        # Get current model state dict
+        model_dict = model.state_dict()
+        
+        # Filter out layers that don't match
+        pretrained_dict_filtered = {}
+        skipped_layers = []
+        for k, v in pretrained_dict.items():
+            if k in model_dict:
+                if model_dict[k].shape == v.shape:
+                    pretrained_dict_filtered[k] = v
+                else:
+                    skipped_layers.append(f'{k}: pretrained {v.shape} vs model {model_dict[k].shape}')
+            else:
+                skipped_layers.append(f'{k} (not in model)')
+        
+        # Load the filtered pretrained weights
+        model_dict.update(pretrained_dict_filtered)
+        model.load_state_dict(model_dict)
+        
+        print(f'  Loaded {len(pretrained_dict_filtered)}/{len(pretrained_dict)} layers from pretrained checkpoint')
+        
+        # Count randomly initialized layers
+        random_init_layers = len(model_dict) - len(pretrained_dict_filtered)
+        if random_init_layers > 0:
+            print(f'  Randomly initialized: {random_init_layers} layers')
+            print(f'    - head_norm (LayerNorm for stability): head_norm.weight, head_norm.bias')
+            print(f'    - adapter (21841→1): adapter.weight, adapter.bias')
+        
+        if skipped_layers and len(skipped_layers) <= 5:
+            for skip_msg in skipped_layers:
+                print(f'  Skipped: {skip_msg}')
+    else:
+        print('Training from scratch (no pretrained weights)')
+    
+    # Initialize the adapter bias to encourage balanced predictions
+    if hasattr(model, 'adapter') and model.adapter is not None:
+        nn.init.constant_(model.adapter.bias, 0.0)
+    
+    model = model.to(device)
+    
+    ema = None
+    if args.use_ema:
+        ema = ModelEma(model, decay=args.ema_decay, device=device)
+    
+    criterion = nn.BCEWithLogitsLoss()
+    
+    optimizer = AdamW(
+        model.parameters(),
+        lr=args.lr,
+        betas=args.betas,
+        weight_decay=args.weight_decay
+    )
+    
+    scheduler = WarmupCosineScheduler(
+        optimizer,
+        warmup_epochs=args.warmup_epochs,
+        total_epochs=args.epochs,
+        base_lr=args.lr,
+        min_lr=args.min_lr
+    )
+    
+    mixup_cutmix = None
+    if args.mixup_alpha > 0 or args.cutmix_alpha > 0:
+        mixup_cutmix = MixupCutmix(
+            mixup_alpha=args.mixup_alpha,
+            cutmix_alpha=args.cutmix_alpha,
+            prob=1.0,
+            switch_prob=0.5
+        )
+        print(f'Using Mixup (alpha={args.mixup_alpha}) and Cutmix (alpha={args.cutmix_alpha})')
+    else:
+        print('Mixup/Cutmix disabled (set --mixup_alpha and --cutmix_alpha to enable)')
+    
+    train_losses, val_losses = [], []
+    train_f1s, val_f1s = [], []
+    train_accs, val_accs = [], []
+    test_f1s, test_accs, test_epochs = [], [], []
+    best_val_f1 = 0.0
+    best_val_acc = 0.0
+    
+    print(f'\nStarting training for {args.epochs} epochs...\n')
+    
+    epoch_pbar = tqdm(range(args.epochs), desc='Training Progress')
+    for epoch in epoch_pbar:
+        start_time = time.time()
+        
+        lr = scheduler.step(epoch)
+        
+        if mixup_cutmix is not None:
+            if epoch < 150:
+                mixup_cutmix.set_enabled(True)
+            elif epoch < 300:
+                progress = (epoch - 150) / 150
+                mixup_cutmix.prob = 1.0 - progress
+                mixup_cutmix.set_enabled(True)
+            else:
+                mixup_cutmix.set_enabled(False)
+        
+        train_loss, train_f1, train_acc = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, epoch, mixup_cutmix, ema, args.label_smoothing
+        )
+        
+        val_model = ema.ema if ema is not None else model
+        val_loss, val_f1, val_acc, val_cm = validate(val_model, val_loader, criterion, device)
+        
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_f1s.append(train_f1)
+        val_f1s.append(val_f1)
+        train_accs.append(train_acc)
+        val_accs.append(val_acc)
+        
+        epoch_time = time.time() - start_time
+        
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+        
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+        
+        epoch_pbar.set_postfix({
+            'Train_F1': f'{train_f1:.4f}',
+            'Val_F1': f'{val_f1:.4f}',
+            'Best_F1': f'{best_val_f1:.4f}',
+            'Val_Acc': f'{val_acc:.4f}',
+            'Best_Acc': f'{best_val_acc:.4f}'
+        })
+        
+        print(f'Epoch [{epoch+1}/{args.epochs}] ({epoch_time:.2f}s) LR: {lr:.6f}')
+        print(f'  Train - Loss: {train_loss:.4f}, F1: {train_f1:.4f}, Acc: {train_acc:.4f}')
+        print(f'  Val   - Loss: {val_loss:.4f}, F1: {val_f1:.4f}, Acc: {val_acc:.4f}')
+        
+        if val_f1 < 0.1 and epoch > args.warmup_epochs:
+            print(f'  WARNING: Validation F1 very low ({val_f1:.4f}) - possible model collapse!')
+        if epoch > 0 and val_f1 < val_f1s[-1] - 0.3:
+            print(f'  WARNING: Validation F1 dropped significantly from {val_f1s[-1]:.4f} to {val_f1:.4f}')
+        
+        if val_f1 == best_val_f1:
+            save_dict = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_f1': val_f1,
+                'val_acc': val_acc,
+            }
+            if ema is not None:
+                save_dict['ema_state_dict'] = ema.ema.state_dict()
+            torch.save(save_dict, os.path.join(args.output_dir, 'best_model_f1.pth'))
+            print(f'  --> New best F1 model saved! (F1: {val_f1:.4f})')
+        
+        if val_acc == best_val_acc:
+            save_dict = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_f1': val_f1,
+                'val_acc': val_acc,
+            }
+            if ema is not None:
+                save_dict['ema_state_dict'] = ema.ema.state_dict()
+            torch.save(save_dict, os.path.join(args.output_dir, 'best_model_acc.pth'))
+            print(f'  --> New best Accuracy model saved! (Acc: {val_acc:.4f})')
+        
+        if (epoch + 1) % args.save_freq == 0 or epoch == args.epochs - 1:
+            save_dict = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_f1': val_f1,
+                'val_acc': val_acc,
+            }
+            if ema is not None:
+                save_dict['ema_state_dict'] = ema.ema.state_dict()
+            torch.save(save_dict, os.path.join(args.output_dir, f'checkpoint_epoch_{epoch+1}.pth'))
+            
+            print(f'\n  Evaluating best accuracy model on test set...')
+            checkpoint = torch.load(os.path.join(args.output_dir, 'best_model_acc.pth'))
+            test_model = convnext_small(
+                num_classes=1,
+                drop_path_rate=args.drop_path_rate,
+                layer_scale_init_value=args.layer_scale_init_value,
+                use_pretrained_head=use_pretrained_head
+            )
+            if ema is not None and 'ema_state_dict' in checkpoint:
+                test_model.load_state_dict(checkpoint['ema_state_dict'])
+            else:
+                test_model.load_state_dict(checkpoint['model_state_dict'])
+            test_model = test_model.to(device)
+            
+            # Find optimal threshold on validation set (optimizing for F1)
+            _, val_probs_temp, val_labels_temp = validate(test_model, val_loader, criterion, device, return_probs=True)
+            opt_thresh, _, _ = find_optimal_threshold(val_probs_temp, val_labels_temp, metric='f1')
+            
+            # Evaluate on test set with optimal threshold
+            test_f1, test_acc, test_cm, _, _, _ = test(test_model, test_loader, device, threshold=opt_thresh)
+            test_f1s.append(test_f1)
+            test_accs.append(test_acc)
+            test_epochs.append(epoch + 1)
+            
+            print(f'  Test (thresh={opt_thresh:.3f}) - F1: {test_f1:.4f}, Acc: {test_acc:.4f}')
+            
+            plot_save_path = os.path.join(args.output_dir, f'training_{epoch+1}.png')
+            plot_metrics(train_losses, val_losses, train_f1s, val_f1s, train_accs, val_accs,
+                        test_f1s, test_accs, test_epochs, plot_save_path)
+            print(f'  Training plot saved to {plot_save_path}')
+        
+        print()
+    
+    print('Training completed!')
+    print(f'Best validation F1: {best_val_f1:.4f}')
+    print(f'Best validation Accuracy: {best_val_acc:.4f}')
+    
+    final_plot_path = os.path.join(args.output_dir, 'training_final.png')
+    plot_metrics(train_losses, val_losses, train_f1s, val_f1s, train_accs, val_accs,
+                test_f1s, test_accs, test_epochs, final_plot_path)
+    print(f'Final training metrics plot saved to {final_plot_path}')
+    
+    print('\nLoading best accuracy model for final evaluation...')
+    checkpoint = torch.load(os.path.join(args.output_dir, 'best_model_acc.pth'))
+    if ema is not None and 'ema_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['ema_state_dict'])
+    else:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    
+    print('\nOptimizing classification threshold on validation set (using F1 metric)...')
+    _, val_probs, val_labels = validate(model, val_loader, criterion, device, return_probs=True)
+    optimal_threshold, optimal_f1, threshold_scores = find_optimal_threshold(val_probs, val_labels, metric='f1')
+    
+    print(f'Optimal threshold: {optimal_threshold:.3f} (F1: {optimal_f1:.4f})')
+    print(f'Default threshold (0.5) F1: {f1_score(val_labels, (val_probs > 0.5).astype(float)):.4f}')
+    
+    print(f'\nFinal evaluation on test set (threshold={optimal_threshold:.3f})...')
+    test_f1, test_acc, test_cm, test_probs, test_preds, test_labels = test(model, test_loader, device, threshold=optimal_threshold)
+    
+    test_f1_default, test_acc_default, test_cm_default, _, test_preds_default, _ = test(model, test_loader, device, threshold=0.5)
+    
+    print(f'\n' + '='*70)
+    print('TEST RESULTS WITH OPTIMIZED THRESHOLD')
+    print('='*70)
+    print(f'Threshold: {optimal_threshold:.3f}')
+    print(f'F1 Score:  {test_f1:.4f}')
+    print(f'Accuracy:  {test_acc:.4f}')
+    print(f'\nConfusion Matrix:')
+    print(f'  {test_cm}')
+    print(f'  TN: {test_cm[0, 0]}, FP: {test_cm[0, 1]}')
+    print(f'  FN: {test_cm[1, 0]}, TP: {test_cm[1, 1]}')
+    
+    if test_cm[1, 1] + test_cm[1, 0] > 0:
+        sensitivity = test_cm[1, 1] / (test_cm[1, 1] + test_cm[1, 0])
+        print(f'\nSensitivity (Recall): {sensitivity:.4f}')
+    
+    if test_cm[0, 0] + test_cm[0, 1] > 0:
+        specificity = test_cm[0, 0] / (test_cm[0, 0] + test_cm[0, 1])
+        print(f'Specificity:          {specificity:.4f}')
+    
+    print(f'\n' + '='*70)
+    print('TEST RESULTS WITH DEFAULT THRESHOLD (0.5)')
+    print('='*70)
+    print(f'F1 Score:  {test_f1_default:.4f}')
+    print(f'Accuracy:  {test_acc_default:.4f}')
+    print(f'\nConfusion Matrix:')
+    print(f'  {test_cm_default}')
+    print('='*70)
+    
+    results = {
+        'optimal_threshold': float(optimal_threshold),
+        'test_f1_optimized': float(test_f1),
+        'test_acc_optimized': float(test_acc),
+        'test_cm_optimized': test_cm.tolist(),
+        'test_f1_default': float(test_f1_default),
+        'test_acc_default': float(test_acc_default),
+        'test_cm_default': test_cm_default.tolist(),
+        'best_val_f1': float(best_val_f1),
+        'best_val_acc': float(best_val_acc),
+        'test_f1s_over_time': [float(x) for x in test_f1s],
+        'test_accs_over_time': [float(x) for x in test_accs],
+        'test_epochs': [int(x) for x in test_epochs],
+        'threshold_scores': [(float(t), float(s)) for t, s in threshold_scores]
+    }
+    
+    np.save(os.path.join(args.output_dir, 'test_results.npy'), results)
+    print(f'\nTest results saved to {args.output_dir}/test_results.npy')
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data-root', type=str, default='ADNI')
-    parser.add_argument('--pretrained', type=str, default="")
-    parser.add_argument('--output-dir', type=str, default='outputs')
-    parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--batch-size', type=int, default=128)
-    parser.add_argument('--img-size', type=int, default=224)
-    parser.add_argument('--lr', type=float, default=1e-5)
-    parser.add_argument('--weight-decay', type=float, default=2e-8)
-    parser.add_argument('--layer-decay', type=float, default=0.8)
-    parser.add_argument('--num-workers', type=int, default=2)
-    parser.add_argument('--save-every', type=int, default=10)
-    parser.add_argument('--label-smoothing', type=float, default=0.1)
-    parser.add_argument('--mix-alpha', type=float, default=0.4, help='alpha parameter for Beta distribution used in mixup/cutmix')
-    parser.add_argument('--mix-max-prob', type=float, default=0, help='starting probability of applying mixup/cutmix (linearly decays)')
-    parser.add_argument('--mix-decay-epochs', type=int, default=100, help='number of epochs over which to decay mix probability to 0')
-    parser.add_argument('--eval-every', type=int, default=10, help='run test evaluation with best.pth every N epochs (0 to disable)')
-    parser.add_argument('--early-stop', type=int, default=75, help='stop training if no val acc improvement for this many epochs (0 to disable)')
+    parser = argparse.ArgumentParser('ConvNeXt-S training for ADNI dataset')
+    
+    parser.add_argument('--data_path', type=str, default='AD_NC',
+                        help='Path to ADNI dataset')
+    parser.add_argument('--output_dir', type=str, default='output',
+                        help='Path to save outputs')
+    parser.add_argument('--pretrained_path', type=str, default='convnext_small_22k_224.pth',
+                        help='Path to pretrained weights (ImageNet-22k). Set to empty string to train from scratch.')
+    parser.add_argument('--batch_size', type=int, default=32,
+                        help='Batch size')
+    parser.add_argument('--epochs', type=int, default=400,
+                        help='Number of epochs')
+    parser.add_argument('--lr', type=float, default=5e-4,
+                        help='Learning rate')
+    parser.add_argument('--min_lr', type=float, default=1e-6,
+                        help='Minimum learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.05,
+                        help='Weight decay')
+    parser.add_argument('--betas', type=float, nargs=2, default=[0.9, 0.999],
+                        help='AdamW betas')
+    parser.add_argument('--warmup_epochs', type=int, default=4,
+                        help='Warmup epochs')
+    parser.add_argument('--input_size', type=int, default=224,
+                        help='Input image size')
+    parser.add_argument('--drop_path_rate', type=float, default=0.0,
+                        help='Drop path rate')
+    parser.add_argument('--layer_scale_init_value', type=float, default=1e-6,
+                        help='Layer scale init value')
+    parser.add_argument('--mixup_alpha', type=float, default=0.8,
+                        help='Mixup alpha (set to 0 to disable)')
+    parser.add_argument('--cutmix_alpha', type=float, default=1.0,
+                        help='Cutmix alpha (set to 0 to disable)')
+    parser.add_argument('--label_smoothing', type=float, default=0.1,
+                        help='Label smoothing')
+    parser.add_argument('--use_ema', action='store_true', default=True,
+                        help='Use EMA')
+    parser.add_argument('--ema_decay', type=float, default=0.9999,
+                        help='EMA decay')
+    parser.add_argument('--num_workers', type=int, default=8,
+                        help='Number of data loading workers')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed')
+    parser.add_argument('--save_freq', type=int, default=20,
+                        help='Save checkpoint frequency')
+    
     args = parser.parse_args()
+    
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    
     main(args)
+
