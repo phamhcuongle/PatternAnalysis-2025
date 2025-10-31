@@ -1,3 +1,12 @@
+"""Training script for ConvNeXt-S on ADNI binary classification.
+
+Key features:
+- Subject-level split to avoid leakage
+- Mixup/CutMix (with late-epoch ramp-down) and label smoothing
+- EMA model tracking and best checkpoint saving (by F1 and Acc)
+- Warmup + cosine LR schedule and post-training threshold optimization
+"""
+
 import os
 import argparse
 import time
@@ -10,13 +19,17 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import f1_score, accuracy_score, confusion_matrix
 from timm.utils import ModelEma
-from tqdm.notebook import tqdm
+from tqdm import tqdm
 
 from modules import convnext_small
 from dataset import build_loader
 
 
 class MixupCutmix:
+    """Utility for applying MixUp or CutMix with a switch probability.
+
+    Enabled state can be toggled during training (e.g., ramp down late epochs).
+    """
     def __init__(self, mixup_alpha=0.8, cutmix_alpha=1.0, prob=1.0, switch_prob=0.5, num_classes=2):
         self.mixup_alpha = mixup_alpha
         self.cutmix_alpha = cutmix_alpha
@@ -71,6 +84,7 @@ class MixupCutmix:
         return mixed_images, mixed_labels
     
     def __call__(self, images, labels):
+        """Randomly apply MixUp or CutMix based on configured probabilities."""
         if not self.enabled or np.random.rand() > self.prob:
             return images, labels
         
@@ -186,6 +200,11 @@ def validate(model, val_loader, criterion, device, threshold=0.5, return_probs=F
 
 
 def find_optimal_threshold(probs, labels, metric='f1'):
+    """Grid-search a probability threshold that optimizes the chosen metric.
+
+    Supported metrics: 'f1', 'balanced_acc', 'youden'.
+    Returns (best_threshold, best_score, [(threshold, score), ...]).
+    """
     thresholds = np.arange(0.1, 0.95, 0.05)
     scores = []
     
@@ -217,6 +236,7 @@ def find_optimal_threshold(probs, labels, metric='f1'):
 
 
 def test(model, test_loader, device, threshold=0.5):
+    """Evaluate model on test loader using a fixed probability threshold."""
     model.eval()
     all_preds = []
     all_labels = []
@@ -301,67 +321,13 @@ def main(args):
     print(f'Val samples: {len(val_loader.dataset)}')
     print(f'Test samples: {len(test_loader.dataset)}')
     
-    # Determine if using pretrained head
-    use_pretrained_head = args.pretrained_path and os.path.exists(args.pretrained_path)
-    
     model = convnext_small(
         num_classes=1,
         drop_path_rate=args.drop_path_rate,
-        layer_scale_init_value=args.layer_scale_init_value,
-        use_pretrained_head=use_pretrained_head
+        layer_scale_init_value=args.layer_scale_init_value
     )
     
-    # Load pretrained weights from ImageNet-22k
-    if use_pretrained_head:
-        print(f'Loading pretrained weights from {args.pretrained_path}')
-        print(f'Using two-stage head: pretrained ImageNet-22k head (21841 classes) + adapter layer (21841→1)')
-        checkpoint = torch.load(args.pretrained_path, map_location='cpu')
-        
-        # Handle different checkpoint formats
-        if 'model' in checkpoint:
-            pretrained_dict = checkpoint['model']
-        elif 'state_dict' in checkpoint:
-            pretrained_dict = checkpoint['state_dict']
-        else:
-            pretrained_dict = checkpoint
-        
-        # Get current model state dict
-        model_dict = model.state_dict()
-        
-        # Filter out layers that don't match
-        pretrained_dict_filtered = {}
-        skipped_layers = []
-        for k, v in pretrained_dict.items():
-            if k in model_dict:
-                if model_dict[k].shape == v.shape:
-                    pretrained_dict_filtered[k] = v
-                else:
-                    skipped_layers.append(f'{k}: pretrained {v.shape} vs model {model_dict[k].shape}')
-            else:
-                skipped_layers.append(f'{k} (not in model)')
-        
-        # Load the filtered pretrained weights
-        model_dict.update(pretrained_dict_filtered)
-        model.load_state_dict(model_dict)
-        
-        print(f'  Loaded {len(pretrained_dict_filtered)}/{len(pretrained_dict)} layers from pretrained checkpoint')
-        
-        # Count randomly initialized layers
-        random_init_layers = len(model_dict) - len(pretrained_dict_filtered)
-        if random_init_layers > 0:
-            print(f'  Randomly initialized: {random_init_layers} layers')
-            print(f'    - head_norm (LayerNorm for stability): head_norm.weight, head_norm.bias')
-            print(f'    - adapter (21841→1): adapter.weight, adapter.bias')
-        
-        if skipped_layers and len(skipped_layers) <= 5:
-            for skip_msg in skipped_layers:
-                print(f'  Skipped: {skip_msg}')
-    else:
-        print('Training from scratch (no pretrained weights)')
-    
-    # Initialize the adapter bias to encourage balanced predictions
-    if hasattr(model, 'adapter') and model.adapter is not None:
-        nn.init.constant_(model.adapter.bias, 0.0)
+    print('Training from scratch')
     
     model = model.to(device)
     
@@ -413,6 +379,7 @@ def main(args):
         
         lr = scheduler.step(epoch)
         
+        # Schedule: keep heavy augments early; ramp down between 100-150; off afterwards
         if mixup_cutmix is not None:
             if epoch < 100:
                 mixup_cutmix.set_enabled(True)
@@ -427,6 +394,7 @@ def main(args):
             model, train_loader, criterion, optimizer, device, epoch, mixup_cutmix, ema, args.label_smoothing
         )
         
+        # Validate using EMA weights if available (typically more stable)
         val_model = ema.ema if ema is not None else model
         val_loss, val_f1, val_acc, val_cm = validate(val_model, val_loader, criterion, device)
         
@@ -462,6 +430,7 @@ def main(args):
         if epoch > 0 and val_f1 < val_f1s[-1] - 0.3:
             print(f'  WARNING: Validation F1 dropped significantly from {val_f1s[-1]:.4f} to {val_f1:.4f}')
         
+        # Save best-by-F1 checkpoint (also stores EMA weights when enabled)
         if val_f1 == best_val_f1:
             save_dict = {
                 'epoch': epoch,
@@ -475,6 +444,7 @@ def main(args):
             torch.save(save_dict, os.path.join(args.output_dir, 'best_model_f1.pth'))
             print(f'  --> New best F1 model saved! (F1: {val_f1:.4f})')
         
+        # Save best-by-Accuracy checkpoint
         if val_acc == best_val_acc:
             save_dict = {
                 'epoch': epoch,
@@ -499,37 +469,6 @@ def main(args):
             if ema is not None:
                 save_dict['ema_state_dict'] = ema.ema.state_dict()
             torch.save(save_dict, os.path.join(args.output_dir, f'checkpoint_epoch_{epoch+1}.pth'))
-            
-            print(f'\n  Evaluating best accuracy model on test set...')
-            checkpoint = torch.load(os.path.join(args.output_dir, 'best_model_acc.pth'))
-            test_model = convnext_small(
-                num_classes=1,
-                drop_path_rate=args.drop_path_rate,
-                layer_scale_init_value=args.layer_scale_init_value,
-                use_pretrained_head=use_pretrained_head
-            )
-            if ema is not None and 'ema_state_dict' in checkpoint:
-                test_model.load_state_dict(checkpoint['ema_state_dict'])
-            else:
-                test_model.load_state_dict(checkpoint['model_state_dict'])
-            test_model = test_model.to(device)
-            
-            # Find optimal threshold on validation set (optimizing for F1)
-            _, val_probs_temp, val_labels_temp = validate(test_model, val_loader, criterion, device, return_probs=True)
-            opt_thresh, _, _ = find_optimal_threshold(val_probs_temp, val_labels_temp, metric='f1')
-            
-            # Evaluate on test set with optimal threshold
-            test_f1, test_acc, test_cm, _, _, _ = test(test_model, test_loader, device, threshold=opt_thresh)
-            test_f1s.append(test_f1)
-            test_accs.append(test_acc)
-            test_epochs.append(epoch + 1)
-            
-            print(f'  Test (thresh={opt_thresh:.3f}) - F1: {test_f1:.4f}, Acc: {test_acc:.4f}')
-            
-            plot_save_path = os.path.join(args.output_dir, f'training_{epoch+1}.png')
-            plot_metrics(train_losses, val_losses, train_f1s, val_f1s, train_accs, val_accs,
-                        test_f1s, test_accs, test_epochs, plot_save_path)
-            print(f'  Training plot saved to {plot_save_path}')
         
         print()
     
@@ -616,9 +555,7 @@ if __name__ == '__main__':
                         help='Path to ADNI dataset')
     parser.add_argument('--output_dir', type=str, default='ADNI_outputs',
                         help='Path to save outputs')
-    parser.add_argument('--pretrained_path', type=str, default='convnext_small_22k_224.pth',
-                        help='Path to pretrained weights (ImageNet-22k). Set to empty string to train from scratch.')
-    parser.add_argument('--batch_size', type=int, default=128,
+    parser.add_argument('--batch_size', type=int, default=4,
                         help='Batch size')
     parser.add_argument('--epochs', type=int, default=200,
                         help='Number of epochs')

@@ -1,3 +1,9 @@
+"""Inference and visualization utilities for ConvNeXt ADNI classifier.
+
+Loads a trained checkpoint, runs predictions for a chosen split, and saves
+confusion matrix, ROC curve, probability histograms, and sample predictions.
+"""
+
 import os
 import argparse
 import numpy as np
@@ -7,7 +13,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score, accuracy_score, confusion_matrix, roc_curve, auc
 import seaborn as sns
 from PIL import Image
-from tqdm.notebook import tqdm
+from tqdm import tqdm
 
 from modules import convnext_small
 from dataset import ADNIDataset, build_transform
@@ -28,15 +34,12 @@ def load_model(checkpoint_path, device):
         state_dict = checkpoint
         print('Loaded model weights (legacy format)')
     
-    # Detect if model uses two-stage head (has head_norm)
-    use_pretrained_head = any('head_norm' in k for k in state_dict.keys())
-    
-    if use_pretrained_head:
-        print('Detected two-stage head architecture (with head_norm)')
-    else:
-        print('Detected single-stage head architecture')
-    
-    model = convnext_small(num_classes=1, use_pretrained_head=use_pretrained_head)
+    # Build model compatible with checkpoint
+    # Heuristically detect legacy two-stage head to construct a compatible model
+    uses_two_stage = any(k.startswith('head_norm') or k.startswith('adapter') for k in state_dict.keys()) 
+    if uses_two_stage:
+        print('Detected legacy two-stage head checkpoint; building compatible model')
+    model = convnext_small(num_classes=1, use_pretrained_head=uses_two_stage)
     model.load_state_dict(state_dict)
     
     model = model.to(device)
@@ -72,6 +75,7 @@ def predict_dataset(model, data_loader, device, threshold=0.5):
             all_labels.extend(labels.cpu().numpy())
             all_probs.extend(probs.cpu().numpy())
             
+            # Keep a small sample of images for qualitative visualization
             if len(all_images) < 20:
                 all_images.extend(images.cpu())
             
@@ -124,6 +128,7 @@ def plot_prediction_examples(images, labels, preds, probs, save_path):
     fig, axes = plt.subplots(4, 5, figsize=(15, 12))
     axes = axes.ravel()
     
+    # De-normalize for visualization using ImageNet statistics
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
     
