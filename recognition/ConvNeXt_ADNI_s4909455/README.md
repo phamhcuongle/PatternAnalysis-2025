@@ -76,7 +76,7 @@ Training script: `train.py`.
 - Loss: `BCEWithLogitsLoss` on a single logit output.
 - Optimizer: AdamW; default `lr=5e-4`, `weight_decay=0.1`, `betas=(0.9, 0.999)`.
 - LR schedule: linear warmup (`warmup_epochs=4`) → cosine decay (`WarmupCosineScheduler`).
-- MixUp/CutMix: enabled early, linearly decayed, disabled after epoch 150 by default.
+- MixUp/CutMix: for the first 100 epochs, the probability remains the same and after that decrease to 0 and disabled at epoch 150.
 - Label smoothing: 0.1 for vanilla batches (no mixing).
 - EMA: `timm.utils.ModelEma` (default enabled) with decay `0.9999`.
 - Checkpoints: saves best by F1 (`best_model_f1.pth`), best by Accuracy (`best_model_acc.pth`), periodic `checkpoint_epoch_*.pth`.
