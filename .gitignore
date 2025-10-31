@@ -4,3 +4,4 @@ recognition/ConvNeXt_ADNI_s4909455/__pycache__
 recognition/ConvNeXt_ADNI_s4909455/Generate
 recognition/ConvNeXt_ADNI_s4909455/docs
 recognition/ConvNeXt_ADNI_s4909455/convnext_small_22k_224.pth
+recognition/ConvNeXt_ADNI_s4909455/ADNI_outputs
