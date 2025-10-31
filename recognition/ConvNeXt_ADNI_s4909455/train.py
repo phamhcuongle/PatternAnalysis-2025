@@ -555,7 +555,7 @@ if __name__ == '__main__':
                         help='Path to ADNI dataset')
     parser.add_argument('--output_dir', type=str, default='ADNI_outputs',
                         help='Path to save outputs')
-    parser.add_argument('--batch_size', type=int, default=4,
+    parser.add_argument('--batch_size', type=int, default=128,
                         help='Batch size')
     parser.add_argument('--epochs', type=int, default=200,
                         help='Number of epochs')
@@ -585,7 +585,7 @@ if __name__ == '__main__':
                         help='Use EMA')
     parser.add_argument('--ema_decay', type=float, default=0.9999,
                         help='EMA decay')
-    parser.add_argument('--num_workers', type=int, default=8,
+    parser.add_argument('--num_workers', type=int, default=2,
                         help='Number of data loading workers')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')

@@ -21,7 +21,7 @@ Binary AD vs NC MRI slice classification using a lightweight ConvNeXt implementa
 
 ## Goal
 
-Classify brain MR images from the ADNI dataset into two classes: Alzheimer's Disease (AD) and Normal Control (NC). The pipeline targets robust generalization through subject-wise splits and carefully chosen augmentations/regularization.
+Classify brain MR images from the ADNI dataset<a href="#ADNI">[2]</a>  into two classes: Alzheimer's Disease (AD) and Normal Control (NC). The pipeline targets robust generalization through subject-wise splits and carefully chosen augmentations/regularization.
 
 # Model Architecture
 
@@ -34,12 +34,12 @@ Classify brain MR images from the ADNI dataset into two classes: Alzheimer's Dis
 - **Head:** single‑stage `Linear(dims[-1] → 1)` for binary logits.
 - **Regularization & stabilization:**
   - LayerScale (init 1e‑6), optional DropPath.
-  - Exponential Moving Average (EMA) of weights (enabled by default in `train.py`).
+  - Exponential Moving Average (EMA)<a href="#EMA">[6]</a> of weights (enabled by default in `train.py`).
 
 #### Adaptation for ADNI Dataset
 
 - Grayscale MRI replicated to 3 channels to match ConvNeXt stem; resized to 224×224.
-- Augmentations include RandAugment, Random Erasing, and horizontal flips to improve robustness.
+- Augmentations include RandAugment<a href="#Aug">[3]</a>, Random Erasing<a href="#Era">[7]</a>, and horizontal flips to improve robustness.
 - Regularization tuned for small data (LayerScale, label smoothing, EMA).
 - Subject‑wise split by patient ID to prevent leakage across splits.
 
@@ -93,7 +93,7 @@ Defaults used (see `train.py`):
 | Min LR (cosine floor)     | 1e-6           |
 | Weight Decay              | 0.1            |
 | Betas                     | (0.9, 0.999)   |
-| Batch Size                | 4              |
+| Batch Size                | 128            |
 | Epochs                    | 200            |
 | Warmup Epochs             | 4              |
 | Input Size                | 224            |
@@ -123,7 +123,7 @@ recognition/ConvNeXt_ADNI_s4909455
 
 Key defaults (see `argparse` in `train.py`):
 
-- `--epochs 200`  `--batch_size 4`  `--input_size 224`  `--num_workers 8`  `--seed 42`
+- `--epochs 200`  `--batch_size 128`  `--input_size 224`  `--num_workers 2`  `--seed 42`
 - `--drop_path_rate 0.0`  `--layer_scale_init_value 1e-6`
 - `--use_ema` (default True)  `--ema_decay 0.9999`
 
@@ -148,17 +148,18 @@ The training and validation losses and accuracies were recorded across 200 epoch
 - AD (Alzheimer’s Disease): 3,002 correctly predicted, 1,458 misclassified as NC.
 - NC (Normal Control): 4,260 correctly predicted, 280 misclassified as AD.
 
-#### Example Predictions
-![Examples](Images/prediction_examples.png)
-
 # Usage
+
+### Clone the Repository
+```bash
+git clone https://github.com/phamhcuongle/PatternAnalysis-2025.git
+cd ./recognition/ConvNeXt_ADNI_s4909455
+```
 
 ### Install dependencies
 
-This project uses PyTorch, torchvision, timm, and common ML/plotting libs.
-
 ```bash
-pip install torch torchvision timm scikit-learn seaborn matplotlib tqdm pillow
+pip install -r requirements.txt
 ```
 
 ### Train
@@ -237,3 +238,5 @@ Plots are saved under `ADNI_outputs/predictions/test/`.
 <a id="Cutmix">[5]</a> Sangdoo Yun, Dongyoon Han, Seong Joon Oh, Sanghyuk Chun, Junsuk Choe, Youngjoon Yoo (2019). CutMix: Regularization Strategy to Train Strong Classifiers with Localizable Features. arXiv:1905.04899 https://arxiv.org/abs/1905.04899
 
 <a id="EMA">[6]</a> Daniel Morales-Brotons, Thijs Vogels, Hadrien Hendrikx (2024). Exponential Moving Average of Weights in Deep Learning: Dynamics and Benefits. arXiv:2411.18704 https://arxiv.org/abs/2411.18704
+
+<a id="Era">[7]</a> Zhun Zhong, Liang Zheng, Guoliang Kang, Shaozi Li, Yi Yang (2017). Random Erasing Data Augmentation. arXiv:1708.04896 https://arxiv.org/abs/1708.04896
